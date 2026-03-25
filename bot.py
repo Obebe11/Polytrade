@@ -175,11 +175,12 @@ class PolymarketBot:
         signer = Account.from_key(PRIVATE_KEY)
 
         self.client = ClobClient(
-            host=CLOB_HOST,
-            key=PRIVATE_KEY,
-            chain_id=CHAIN_ID,
-            signature_type=0,
-            funder=signer.address,
+    host=CLOB_HOST,
+    key=PRIVATE_KEY,
+    chain_id=CHAIN_ID,
+    signature_type=0,
+    funder=signer.address,
+        )
         )
 
         if API_KEY and API_SECRET and API_PASSPHRASE:
