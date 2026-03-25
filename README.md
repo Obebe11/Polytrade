@@ -1,0 +1,2 @@
+# Polytrade
+Bot for polymarker
