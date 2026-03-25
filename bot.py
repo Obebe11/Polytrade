@@ -247,7 +247,7 @@ class PolymarketBot:
                 )
             )
             # Шаг 2: отправляем как GTC (Good Till Cancelled) — лимитный
-            resp     = self.client.post_order(signed, OrderType.GTC)
+            resp     = self.client.post_order(signed, OrderType.GTD)
             order_id = resp.get("orderID") or resp.get("order_id", "unknown")
             log.info(f"  ✓ Ордер принят: {order_id}")
             return order_id
