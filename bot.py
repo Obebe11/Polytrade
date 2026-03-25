@@ -181,7 +181,7 @@ class PolymarketBot:
     signature_type=0,
     funder=signer.address,
         )
-        )
+        
 
         if API_KEY and API_SECRET and API_PASSPHRASE:
             self.client.set_api_creds(ApiCreds(
