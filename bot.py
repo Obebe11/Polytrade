@@ -40,10 +40,10 @@ MAX_PER_CAT     = int(os.getenv("MAX_PER_CAT", "2"))
 MIN_SIZE        = float(os.getenv("MIN_SIZE", "5"))
 MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "200"))
 
-TRADE_YES = os.getenv("TRADE_YES", "true").lower() == "true"
-TRADE_NO  = os.getenv("TRADE_NO", "true").lower() == "true"
-ALLOW_BOTH_SIDES_SAME_MARKET = os.getenv("ALLOW_BOTH_SIDES_SAME_MARKET", "false").lower() == "true"
-RESTING_ORDER_TICKS_BELOW_ASK = int(os.getenv("RESTING_ORDER_TICKS_BELOW_ASK", "1"))
+TRADE_YES = True
+TRADE_NO = True
+ALLOW_BOTH_SIDES_SAME_MARKET = True
+RESTING_ORDER_TICKS_BELOW_ASK = 1
 
 EXCLUDED = {
     "elections", "election", "politics", "voting", "president",
@@ -233,10 +233,7 @@ class PolymarketBot:
 
         log.info(f"Signature type : {SIGNATURE_TYPE}")
         log.info(f"Funder address : {funder}")
-        log.info(
-            f"Trade sides: YES={TRADE_YES} NO={TRADE_NO} "
-            f"allow_both_same_market={ALLOW_BOTH_SIDES_SAME_MARKET}"
-        )
+        log.info("Trade sides are hardcoded: YES=True NO=True allow_both_same_market=True")
 
         self.client = ClobClient(
             host=CLOB_HOST,
@@ -346,22 +343,21 @@ class PolymarketBot:
             if seen_cats.get(cat, 0) >= MAX_PER_CAT:
                 continue
 
-            if not ALLOW_BOTH_SIDES_SAME_MARKET and self.has_market_position(market_key):
-                continue
 
             outcomes = build_outcomes(token_ids)
             if not outcomes:
                 continue
 
-            placed_in_this_market = False
+            log.info(
+                f"MARKET outcomes | {question[:60]} | token_ids={token_ids} | outcomes={outcomes}"
+            )
+
 
             for outcome, token_id in outcomes:
                 position_key = f"{token_id}:{outcome}"
                 if position_key in self.positions:
                     continue
 
-                if placed_in_this_market and not ALLOW_BOTH_SIDES_SAME_MARKET:
-                    break
 
                 best_ask = get_best_ask(self.client, token_id)
                 if best_ask is None:
@@ -407,10 +403,6 @@ class PolymarketBot:
                     }
                     seen_cats[cat] = seen_cats.get(cat, 0) + 1
                     placed += 1
-                    placed_in_this_market = True
-
-                    if not ALLOW_BOTH_SIDES_SAME_MARKET:
-                        break
 
                 time.sleep(0.3)
 
