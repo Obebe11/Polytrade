@@ -177,6 +177,8 @@ def fetch_markets() -> list:
     url = (
         f"{GAMMA_HOST}/events"
         f"?active=true&closed=false"
+        f"&enable_order_book=true"      # только рынки с активным стаканом
+        f"&liquidity_num_min=100"       # минимум $100 ликвидности
         f"&limit={MARKETS_TO_SCAN}&offset=0"
     )
     try:
@@ -185,6 +187,9 @@ def fetch_markets() -> list:
         markets = []
         for event in resp.json():
             for m in event.get("markets", []):
+                # Дополнительная проверка на уровне самого рынка
+                if not m.get("enableOrderBook", True):
+                    continue
                 m["_event_tags"]  = [t.get("label", "") for t in event.get("tags", [])]
                 m["_event_title"] = event.get("title", "")
                 m["_end_date"]    = event.get("endDate") or m.get("endDate")
@@ -194,7 +199,6 @@ def fetch_markets() -> list:
     except Exception as e:
         log.error(f"Ошибка загрузки рынков: {e}")
         return []
-
 
 def get_orderbook_data(client: ClobClient, token_id: str) -> Optional[dict]:
     """
