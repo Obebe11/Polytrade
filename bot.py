@@ -177,8 +177,6 @@ def fetch_markets() -> list:
     url = (
         f"{GAMMA_HOST}/events"
         f"?active=true&closed=false"
-        f"&enable_order_book=true"      # только рынки с активным стаканом
-        f"&liquidity_num_min=100"       # минимум $100 ликвидности
         f"&limit={MARKETS_TO_SCAN}&offset=0"
     )
     try:
@@ -187,9 +185,6 @@ def fetch_markets() -> list:
         markets = []
         for event in resp.json():
             for m in event.get("markets", []):
-                # Дополнительная проверка на уровне самого рынка
-                if not m.get("enableOrderBook", True):
-                    continue
                 m["_event_tags"]  = [t.get("label", "") for t in event.get("tags", [])]
                 m["_event_title"] = event.get("title", "")
                 m["_end_date"]    = event.get("endDate") or m.get("endDate")
@@ -199,6 +194,7 @@ def fetch_markets() -> list:
     except Exception as e:
         log.error(f"Ошибка загрузки рынков: {e}")
         return []
+
 
 def get_orderbook_data(client: ClobClient, token_id: str) -> Optional[dict]:
     """
@@ -388,26 +384,7 @@ class PolymarketBot:
             if not token_ids:
                 continue
 
-            token_id = token_ids[0]
-            if token_id in self.positions:
-                continue
-
             question = m.get("question") or m.get("_event_title", "")
-
-            # [FIX-6, FIX-7] Получаем стакан один раз — берём оттуда
-            # best_ask, min_order_size и tick_size
-            book_data = get_orderbook_data(self.client, token_id)
-            if book_data is None:
-                continue
-
-            best_ask      = book_data["best_ask"]
-            min_order_size = book_data["min_order_size"]
-            tick_size     = book_data["tick_size"]
-
-            if best_ask is None:
-                continue
-            if not (MIN_PRICE <= best_ask <= MAX_PRICE):
-                continue
 
             days = days_until(m.get("_end_date"))
             if days is None or days < MIN_DAYS or days > MAX_DAYS:
@@ -420,38 +397,67 @@ class PolymarketBot:
             if seen_cats.get(cat, 0) >= MAX_PER_CAT:
                 continue
 
-            # [FIX-5] Размер считается с учётом min_order_size из стакана
-            size     = calc_size(portfolio, best_ask, min_order_size)
-            neg_risk = get_neg_risk(self.client, token_id)
+            # [FIX-10] Проверяем ОБА токена (YES и NO).
+            # Если YES=0.99, то NO=0.01 — именно NO нас интересует.
+            # token_ids[0] = YES, token_ids[1] = NO (если есть)
+            outcome_labels = ["YES", "NO"]
+            token_found = False
 
-            log.info(
-                f"✔ [{cat.upper()}] {question[:60]}"
-                f" | ask={best_ask:.4f} | days={days:.0f}"
-                f" | size={size} | min_size={min_order_size}"
-            )
+            for idx, token_id in enumerate(token_ids):
+                if token_id in self.positions:
+                    continue
 
-            order_id = self.place_order(
-                token_id=token_id,
-                price=best_ask,
-                size=size,
-                tick_size=tick_size,
-                neg_risk=neg_risk,
-                question=question,
-            )
+                book_data = get_orderbook_data(self.client, token_id)
+                if book_data is None:
+                    continue
 
-            if order_id:
-                self.positions[token_id] = {
-                    "order_id":  order_id,
-                    "question":  question,
-                    "category":  cat,
-                    "price":     best_ask,
-                    "size":      size,
-                    "placed_at": datetime.utcnow().isoformat(),
-                }
-                seen_cats[cat] = seen_cats.get(cat, 0) + 1
-                placed += 1
+                best_ask       = book_data["best_ask"]
+                min_order_size = book_data["min_order_size"]
+                tick_size      = book_data["tick_size"]
 
-            time.sleep(0.3)
+                if best_ask is None:
+                    continue
+                if not (MIN_PRICE <= best_ask <= MAX_PRICE):
+                    continue
+
+                outcome = outcome_labels[idx] if idx < len(outcome_labels) else f"token{idx}"
+                log.info(
+                    f"✔ [{cat.upper()}] {question[:55]} [{outcome}]"
+                    f" | ask={best_ask:.4f} | days={days:.0f}"
+                    f" | size_min={min_order_size}"
+                )
+
+                # [FIX-5] Размер считается с учётом min_order_size из стакана
+                size     = calc_size(portfolio, best_ask, min_order_size)
+                neg_risk = get_neg_risk(self.client, token_id)
+
+                order_id = self.place_order(
+                    token_id=token_id,
+                    price=best_ask,
+                    size=size,
+                    tick_size=tick_size,
+                    neg_risk=neg_risk,
+                    question=f"{question} [{outcome}]",
+                )
+
+                if order_id:
+                    self.positions[token_id] = {
+                        "order_id":  order_id,
+                        "question":  question,
+                        "outcome":   outcome,
+                        "category":  cat,
+                        "price":     best_ask,
+                        "size":      size,
+                        "placed_at": datetime.utcnow().isoformat(),
+                    }
+                    seen_cats[cat] = seen_cats.get(cat, 0) + 1
+                    placed += 1
+                    token_found = True
+
+                time.sleep(0.3)
+
+            # лимит категории считается per-market, не per-token
+            _ = token_found
 
         log.info("=" * 60)
         log.info(f"Готово! Ордеров размещено: {placed}")
@@ -472,3 +478,4 @@ if __name__ == "__main__":
             "Polymarket — добавь FUNDER_ADDRESS=0x... в .env"
         )
     PolymarketBot().run_once()
+  
