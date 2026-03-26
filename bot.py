@@ -40,17 +40,15 @@ GAMMA_HOST = "https://gamma-api.polymarket.com"
 CHAIN_ID   = 137
 
 # ── Параметры стратегии ──────────────────────────────────
-MIN_PRICE               = 0.001
-MAX_PRICE               = 0.030
-RISK_PCT                = float(os.getenv("RISK_PCT", "0.02"))
-MIN_DAYS                = 3
-MAX_DAYS                = 365
-MAX_PER_CAT             = 2
-MIN_SIZE                = 5      # минимум 5 контрактов (требование биржи для лимитных)
-PRICE_OFFSET            = 0.001  # ставим чуть выше аска для быстрого исполнения
-MARKETS_TO_SCAN         = int(os.getenv("MARKETS_TO_SCAN", "200"))
-MAX_ORDER_USD           = float(os.getenv("MAX_ORDER_USD", "25"))
-MAX_CONTRACTS_PER_ORDER = float(os.getenv("MAX_CONTRACTS_PER_ORDER", "1000"))
+MIN_PRICE       = 0.001
+MAX_PRICE       = 0.030
+RISK_PCT        = 0.02
+MIN_DAYS        = 3
+MAX_DAYS        = 365
+MAX_PER_CAT     = 2
+MIN_SIZE        = 5      # минимум 5 контрактов (требование биржи для лимитных)
+RESTING_ORDER_TICKS_BELOW_ASK = int(os.getenv("RESTING_ORDER_TICKS_BELOW_ASK", "1"))
+MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "200"))
 
 # ── Исключённые ключевые слова ───────────────────────────
 EXCLUDED = {
@@ -92,47 +90,12 @@ def parse_token_ids(raw) -> list:
     return []
 
 
-def _extract_free_balance(payload) -> Optional[float]:
-    if payload is None:
-        return None
-    if isinstance(payload, (int, float)):
-        return float(payload)
-
-    candidates = (
-        "free", "available", "balance", "availableBalance",
-        "available_balance", "free_balance", "usdc"
-    )
-    for key in candidates:
-        value = payload.get(key) if isinstance(payload, dict) else getattr(payload, key, None)
-        if value is not None:
-            try:
-                return float(value)
-            except Exception:
-                continue
-    return None
-
-
-def get_free_usdc(client: ClobClient) -> float:
+def get_portfolio_value(client: ClobClient) -> float:
     try:
-        if hasattr(client, "get_balance_allowance"):
-            payload = client.get_balance_allowance()
-            free = _extract_free_balance(payload)
-            if free is not None:
-                return free
-    except Exception as e:
-        log.warning(f"Не удалось получить free balance через get_balance_allowance(): {e}")
-
-    try:
-        payload = client.get_balance()
-        free = _extract_free_balance(payload)
-        if free is not None:
-            return free
-    except Exception as e:
-        log.warning(f"Не удалось получить баланс через get_balance(): {e}")
-
-    fallback = float(os.getenv("PORTFOLIO_VALUE", "100"))
-    log.warning(f"Использую fallback PORTFOLIO_VALUE={fallback}")
-    return fallback
+        b = client.get_balance()
+        return float(b.get("balance", 0))
+    except Exception:
+        return float(os.getenv("PORTFOLIO_VALUE", "100"))
 
 
 def days_until(s: Optional[str]) -> Optional[float]:
@@ -189,6 +152,49 @@ def get_best_ask(client: ClobClient, token_id: str) -> Optional[float]:
         return None
 
 
+def get_best_bid(client: ClobClient, token_id: str) -> Optional[float]:
+    try:
+        book = client.get_order_book(token_id)
+        bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
+        if not bids:
+            return None
+        prices = [float(b.price if hasattr(b, "price") else b["price"]) for b in bids]
+        return max(prices) if prices else None
+    except Exception:
+        return None
+
+
+def calc_resting_buy_price(best_bid: Optional[float], best_ask: float, tick_size: str) -> Optional[float]:
+    """
+    Возвращает NON-MARKETABLE BUY цену:
+    - всегда строго ниже best ask
+    - по возможности улучшаем best bid на 1 тик
+    - если спред слишком узкий, ставим на 1 тик ниже ask
+    - если ниже ask поставить нельзя, рынок пропускаем
+    """
+    try:
+        tick = float(tick_size)
+        if tick <= 0 or best_ask <= 0:
+            return None
+
+        max_resting_price = round(best_ask - tick, 6)
+        if max_resting_price <= 0:
+            return None
+
+        if best_bid is None or best_bid <= 0:
+            return max_resting_price
+
+        improved_bid = round(best_bid + tick, 6)
+        order_price = min(improved_bid, max_resting_price)
+
+        if order_price <= 0 or order_price >= best_ask:
+            return None
+
+        return round(order_price, 6)
+    except Exception:
+        return None
+
+
 def get_tick_size(client: ClobClient, token_id: str) -> str:
     try:
         ts = client.get_tick_size(token_id)
@@ -204,42 +210,15 @@ def get_neg_risk(client: ClobClient, token_id: str) -> bool:
         return False
 
 
-def calc_limit_price(price: float, tick_size: str) -> float:
-    tick = float(tick_size)
-    order_price = min(price + PRICE_OFFSET, MAX_PRICE)
-    return round(round(order_price / tick) * tick, 6)
-
-
-def calc_size(free_usd: float, limit_price: float) -> float:
+def calc_size(portfolio: float, price: float) -> float:
     """
-    Размер позиции ограничен:
-    1) risk % от свободного баланса
-    2) жёстким потолком MAX_ORDER_USD
-    3) жёстким потолком MAX_CONTRACTS_PER_ORDER
-    4) фактически доступным free_usd
+    Размер позиции = (портфель * риск%) / цена
+    Минимум MIN_SIZE контрактов (требование биржи для лимитных ордеров)
     """
-    if limit_price <= 0:
+    if price <= 0:
         return float(MIN_SIZE)
-
-    risk_usd = max(free_usd * RISK_PCT, 0.0)
-    budget_usd = min(risk_usd, MAX_ORDER_USD, free_usd)
-
-    if budget_usd <= 0:
-        return 0.0
-
-    size = budget_usd / limit_price
-    size = min(size, MAX_CONTRACTS_PER_ORDER)
-
-    # Если даже минимальный размер не помещается в бюджет — пропускаем рынок
-    min_cost = MIN_SIZE * limit_price
-    if budget_usd < min_cost:
-        return 0.0
-
-    size = max(round(size, 2), float(MIN_SIZE))
-    affordable_size = round(free_usd / limit_price, 2)
-    size = min(size, affordable_size, MAX_CONTRACTS_PER_ORDER)
-
-    return round(size, 2)
+    size = (portfolio * RISK_PCT) / price
+    return max(round(size, 2), float(MIN_SIZE))
 
 
 # ════════════════════════════════════════════════════════
@@ -283,21 +262,29 @@ class PolymarketBot:
     def place_order(
         self,
         token_id: str,
-        price: float,
+        best_ask: float,
+        best_bid: Optional[float],
         size: float,
         tick_size: str,
         question: str,
     ) -> Optional[str]:
-        order_price = calc_limit_price(price, tick_size)
-        cost = round(order_price * size, 4)
+        order_price = calc_resting_buy_price(best_bid, best_ask, tick_size)
+        if order_price is None:
+            log.info(
+                f"  … Пропуск ордера | {question[:50]}"
+                f" | ask={best_ask:.4f} | bid={(best_bid or 0):.4f}"
+                f" | нельзя поставить resting BUY ниже ask"
+            )
+            return None
 
+        cost = round(order_price * size, 4)
         log.info(
-            f"  → LIMIT BUY | {question[:50]}"
+            f"  → RESTING LIMIT BUY | {question[:50]}"
+            f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
             f" | price={order_price:.4f} | size={size} | cost=${cost}"
         )
 
         try:
-            # Шаг 1: создаём подписанный лимитный ордер
             signed = self.client.create_order(
                 OrderArgs(
                     token_id=token_id,
@@ -306,10 +293,9 @@ class PolymarketBot:
                     side=BUY,
                 )
             )
-            # Шаг 2: отправляем как GTC (Good Till Cancelled) — лимитный
             resp     = self.client.post_order(signed, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("order_id", "unknown")
-            log.info(f"  ✓ Ордер принят: {order_id}")
+            log.info(f"  ✓ Resting ордер принят: {order_id}")
             return order_id
         except Exception as e:
             log.error(f"  ✗ Ошибка: {e}")
@@ -319,13 +305,8 @@ class PolymarketBot:
         log.info("=" * 60)
         log.info(f"Запуск: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        free_usd = get_free_usdc(self.client)
-        log.info(
-            f"Свободный баланс: ${free_usd:.2f} | "
-            f"risk_pct={RISK_PCT:.4f} | "
-            f"max_order_usd=${MAX_ORDER_USD:.2f} | "
-            f"max_contracts={MAX_CONTRACTS_PER_ORDER:.0f}"
-        )
+        portfolio = get_portfolio_value(self.client)
+        log.info(f"Портфель: ${portfolio:.2f}")
 
         markets   = fetch_markets()
         placed    = 0
@@ -347,6 +328,8 @@ class PolymarketBot:
             if not (MIN_PRICE <= best_ask <= MAX_PRICE):
                 continue
 
+            best_bid = get_best_bid(self.client, token_id)
+
             days = days_until(m.get("_end_date"))
             if days is None or days < MIN_DAYS or days > MAX_DAYS:
                 continue
@@ -358,28 +341,28 @@ class PolymarketBot:
             if seen_cats.get(cat, 0) >= MAX_PER_CAT:
                 continue
 
-            tick_size    = get_tick_size(self.client, token_id)
-            limit_price  = calc_limit_price(best_ask, tick_size)
-            size         = calc_size(free_usd, limit_price)
-            est_cost_usd = round(limit_price * size, 4)
-
-            if size < MIN_SIZE or est_cost_usd <= 0:
+            tick_size = get_tick_size(self.client, token_id)
+            resting_price = calc_resting_buy_price(best_bid, best_ask, tick_size)
+            if resting_price is None:
                 log.info(
                     f"… Пропуск [{cat.upper()}] {question[:60]}"
-                    f" | ask={best_ask:.4f} | limit={limit_price:.4f}"
-                    f" | free=${free_usd:.2f} — недостаточно бюджета под MIN_SIZE"
+                    f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
+                    f" | невозможно поставить resting BUY"
                 )
                 continue
 
+            size = calc_size(portfolio, resting_price)
+
             log.info(
                 f"✔ [{cat.upper()}] {question[:60]}"
-                f" | ask={best_ask:.4f} | limit={limit_price:.4f}"
-                f" | days={days:.0f} | size={size} | free=${free_usd:.2f}"
+                f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
+                f" | resting={resting_price:.4f} | days={days:.0f} | size={size}"
             )
 
             order_id = self.place_order(
                 token_id=token_id,
-                price=best_ask,
+                best_ask=best_ask,
+                best_bid=best_bid,
                 size=size,
                 tick_size=tick_size,
                 question=question,
@@ -396,7 +379,6 @@ class PolymarketBot:
                 }
                 seen_cats[cat] = seen_cats.get(cat, 0) + 1
                 placed += 1
-                free_usd = max(free_usd - est_cost_usd, 0.0)
 
             time.sleep(0.3)
 
