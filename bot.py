@@ -45,11 +45,6 @@ TRADE_NO = True
 ALLOW_BOTH_SIDES_SAME_MARKET = True
 RESTING_ORDER_TICKS_BELOW_ASK = 1
 
-EXCLUDED = {
-    "elections", "election", "politics", "voting", "president",
-    "senate", "congress", "political", "vote", "ballot",
-    "democrat", "republican", "midterm", "primary", "caucus",
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -234,6 +229,7 @@ class PolymarketBot:
         log.info(f"Signature type : {SIGNATURE_TYPE}")
         log.info(f"Funder address : {funder}")
         log.info("Trade sides are hardcoded: YES=True NO=True allow_both_same_market=True")
+        log.info("Political markets filter: DISABLED")
 
         self.client = ClobClient(
             host=CLOB_HOST,
@@ -336,8 +332,6 @@ class PolymarketBot:
             if days is None or days < MIN_DAYS or days > MAX_DAYS:
                 continue
 
-            if is_election(m):
-                continue
 
             cat = (m.get("_event_tags") or ["other"])[0].lower()
             if seen_cats.get(cat, 0) >= MAX_PER_CAT:
