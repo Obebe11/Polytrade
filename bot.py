@@ -38,7 +38,7 @@ MIN_DAYS        = int(os.getenv("MIN_DAYS", "3"))
 MAX_DAYS        = int(os.getenv("MAX_DAYS", "365"))
 MAX_PER_CAT     = int(os.getenv("MAX_PER_CAT", "2"))
 MIN_SIZE        = float(os.getenv("MIN_SIZE", "5"))
-MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "200"))
+MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "10000"))
 
 TRADE_YES = True
 TRADE_NO = True
