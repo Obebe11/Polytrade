@@ -1,8 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════╗
 ║         POLYMARKET TRADING BOT — bot.py                  ║
-║ YES + NO + resting limit orders                         ║
+║  Поиск → Фильтрация → Лимитные ордера → Риск-контроль   ║
 ╚══════════════════════════════════════════════════════════╝
+
+ВАЖНО — типы подписи (SIGNATURE_TYPE в .env):
+  0 = EOA         — обычный кошелёк, сам платит газ
+  1 = POLY_PROXY  — аккаунт Polymarket через email/Google
+  2 = GNOSIS_SAFE — аккаунт Polymarket через MetaMask/Rabby
+
+FUNDER_ADDRESS = proxy-адрес из polymarket.com/settings
 """
 
 import os
@@ -16,8 +23,9 @@ from dotenv import load_dotenv
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
+# ── Загрузка конфига ─────────────────────────────────────
 load_dotenv()
 
 PRIVATE_KEY    = os.getenv("PRIVATE_KEY")
@@ -31,21 +39,29 @@ CLOB_HOST  = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 CHAIN_ID   = 137
 
-MIN_PRICE       = float(os.getenv("MIN_PRICE", "0.001"))
-MAX_PRICE       = float(os.getenv("MAX_PRICE", "0.030"))
-RISK_PCT        = float(os.getenv("RISK_PCT", "0.02"))
-MIN_DAYS        = int(os.getenv("MIN_DAYS", "3"))
-MAX_DAYS        = int(os.getenv("MAX_DAYS", "365"))
-MAX_PER_CAT     = int(os.getenv("MAX_PER_CAT", "2"))
-MIN_SIZE        = float(os.getenv("MIN_SIZE", "5"))
-MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "10000"))
+# ── Параметры стратегии ──────────────────────────────────
+MIN_PRICE       = 0.001
+MAX_PRICE       = 0.030
+RISK_PCT        = 0.02
+MIN_DAYS        = 3
+MAX_DAYS        = 365
+MAX_PER_CAT     = 2
+MIN_SIZE        = 5      # минимум 5 контрактов (требование биржи для лимитных)
+PRICE_OFFSET    = 0.001  # ставим чуть выше аска для быстрого исполнения
+MARKETS_TO_SCAN = int(os.getenv("MARKETS_TO_SCAN", "200"))
 
-TRADE_YES = True
-TRADE_NO = True
-ALLOW_BOTH_SIDES_SAME_MARKET = True
-RESTING_ORDER_TICKS_BELOW_ASK = 1
+# Величина профита, при которой позиция закрывается в режиме закрытия (в процентах)
+# Например, 500 означает закрывать позиции при приросте 500% и более (5-кратный рост).
+CLOSE_PROFIT_PCT = float(os.getenv("CLOSE_PROFIT_PCT", "500"))
 
+# ── Исключённые ключевые слова ───────────────────────────
+EXCLUDED = {
+    "elections", "election", "politics", "voting", "president",
+    "senate", "congress", "political", "vote", "ballot",
+    "democrat", "republican", "midterm", "primary", "caucus",
+}
 
+# ── Логгер ───────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -56,6 +72,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("polybot")
 
+
+# ════════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ════════════════════════════════════════════════════════
 
 def parse_token_ids(raw) -> list:
     if not raw:
@@ -124,32 +144,28 @@ def fetch_markets() -> list:
         return []
 
 
-def get_order_book_sides(client: ClobClient, token_id: str):
+def get_best_ask(client: ClobClient, token_id: str) -> Optional[float]:
     try:
         book = client.get_order_book(token_id)
         asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
-        bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
-        return bids, asks
-    except Exception:
-        return [], []
-
-
-def get_best_ask(client: ClobClient, token_id: str) -> Optional[float]:
-    bids, asks = get_order_book_sides(client, token_id)
-    if not asks:
-        return None
-    try:
-        return min(float(a.price if hasattr(a, "price") else a["price"]) for a in asks)
+        if not asks:
+            return None
+        prices = [float(a.price if hasattr(a, "price") else a["price"]) for a in asks]
+        return min(prices) if prices else None
     except Exception:
         return None
 
-
+# Получить лучшую бид-цену для указанного токена. Это максимальная цена, по которой
+# другие участники готовы купить токен, полезно для закрытия (продажи) позиций.
 def get_best_bid(client: ClobClient, token_id: str) -> Optional[float]:
-    bids, asks = get_order_book_sides(client, token_id)
-    if not bids:
-        return None
     try:
-        return max(float(b.price if hasattr(b, "price") else b["price"]) for b in bids)
+        book = client.get_order_book(token_id)
+        # py_clob_client возвращает bids либо как атрибут, либо как словарь
+        bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
+        if not bids:
+            return None
+        prices = [float(b.price if hasattr(b, "price") else b["price"]) for b in bids]
+        return max(prices) if prices else None
     except Exception:
         return None
 
@@ -162,74 +178,38 @@ def get_tick_size(client: ClobClient, token_id: str) -> str:
         return "0.01"
 
 
+def get_neg_risk(client: ClobClient, token_id: str) -> bool:
+    try:
+        return bool(client.get_neg_risk(token_id))
+    except Exception:
+        return False
+
+
 def calc_size(portfolio: float, price: float) -> float:
+    """
+    Размер позиции = (портфель * риск%) / цена
+    Минимум MIN_SIZE контрактов (требование биржи для лимитных ордеров)
+    """
     if price <= 0:
         return float(MIN_SIZE)
     size = (portfolio * RISK_PCT) / price
     return max(round(size, 2), float(MIN_SIZE))
 
 
-def calc_resting_buy_price(best_bid: Optional[float], best_ask: float, tick_size: str) -> Optional[float]:
-    """
-    Passive BUY:
-    - строго ниже best ask
-    - по возможности на 1 тик выше best bid
-    - иначе на несколько тиков ниже ask
-    """
-    try:
-        tick = float(tick_size)
-        if tick <= 0 or best_ask <= 0:
-            return None
-
-        steps_below_ask = max(1, RESTING_ORDER_TICKS_BELOW_ASK)
-        max_resting_price = round(best_ask - tick * steps_below_ask, 6)
-        if max_resting_price <= 0:
-            return None
-
-        if best_bid is None or best_bid <= 0:
-            return max_resting_price
-
-        improved_bid = round(best_bid + tick, 6)
-        order_price = min(improved_bid, max_resting_price)
-
-        if order_price >= best_ask:
-            order_price = round(best_ask - tick, 6)
-
-        if order_price <= 0 or order_price >= best_ask:
-            return None
-
-        return round(order_price, 6)
-    except Exception:
-        return None
-
-
-def build_outcomes(token_ids: list) -> list:
-    """
-    Polymarket binary market:
-    token_ids[0] = YES
-    token_ids[1] = NO
-    """
-    outcomes = []
-    if len(token_ids) >= 1 and TRADE_YES:
-        outcomes.append(("YES", token_ids[0]))
-    if len(token_ids) >= 2 and TRADE_NO:
-        outcomes.append(("NO", token_ids[1]))
-    if len(token_ids) == 1 and TRADE_YES and not outcomes:
-        outcomes.append(("YES", token_ids[0]))
-    return outcomes
-
+# ════════════════════════════════════════════════════════
+#  БОТ
+# ════════════════════════════════════════════════════════
 
 class PolymarketBot:
 
     def __init__(self):
         from eth_account import Account
         signer = Account.from_key(PRIVATE_KEY)
+
         funder = FUNDER_ADDRESS if FUNDER_ADDRESS else signer.address
 
         log.info(f"Signature type : {SIGNATURE_TYPE}")
         log.info(f"Funder address : {funder}")
-        log.info("Trade sides are hardcoded: YES=True NO=True allow_both_same_market=True")
-        log.info("Political markets filter: DISABLED")
 
         self.client = ClobClient(
             host=CLOB_HOST,
@@ -253,40 +233,58 @@ class PolymarketBot:
             log.info(f"API KEY: {creds.api_key}")
 
         self.positions: dict = {}
+        # При инициализации пытаемся загрузить ранее сохранённые позиции, чтобы не торговать
+        # повторно те же токены и учитывать открытые позиции при закрытии.
+        self.load_positions()
+
+    def load_positions(self) -> None:
+        """
+        Загрузить сохранённые позиции из файла positions.json, если он существует.
+        Файл содержит словарь token_id -> информация о позиции.
+        """
         try:
-            if os.path.exists("positions.json"):
-                with open("positions.json", "r", encoding="utf-8") as f:
-                    self.positions = json.load(f)
+            with open("positions.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    self.positions = data
+                else:
+                    self.positions = {}
         except Exception:
+            # Файл отсутствует или повреждён — начинаем с пустого портфеля
             self.positions = {}
+
+    def save_positions(self) -> None:
+        """
+        Сохранить текущие позиции в файл positions.json. Этот метод перезаписывает файл.
+        """
+        try:
+            with open("positions.json", "w", encoding="utf-8") as f:
+                json.dump(self.positions, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.error(f"Не удалось сохранить позиции: {e}")
 
     def place_order(
         self,
         token_id: str,
-        outcome: str,
-        best_bid: Optional[float],
-        best_ask: float,
+        price: float,
         size: float,
         tick_size: str,
         question: str,
     ) -> Optional[str]:
-        order_price = calc_resting_buy_price(best_bid, best_ask, tick_size)
-        if order_price is None:
-            log.info(
-                f"  … Пропуск {outcome} | {question[:50]}"
-                f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
-                f" | нельзя поставить resting BUY"
-            )
-            return None
+        tick = float(tick_size)
+
+        # Цена лимитного ордера — чуть выше аска для быстрого исполнения
+        order_price = min(price + PRICE_OFFSET, MAX_PRICE)
+        order_price = round(round(order_price / tick) * tick, 6)
 
         cost = round(order_price * size, 4)
         log.info(
-            f"  → RESTING LIMIT BUY [{outcome}] | {question[:50]}"
-            f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
+            f"  → LIMIT BUY | {question[:50]}"
             f" | price={order_price:.4f} | size={size} | cost=${cost}"
         )
 
         try:
+            # Шаг 1: создаём подписанный лимитный ордер
             signed = self.client.create_order(
                 OrderArgs(
                     token_id=token_id,
@@ -295,19 +293,127 @@ class PolymarketBot:
                     side=BUY,
                 )
             )
-            resp = self.client.post_order(signed, OrderType.GTC)
+            # Шаг 2: отправляем как GTC (Good Till Cancelled) — лимитный
+            resp     = self.client.post_order(signed, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("order_id", "unknown")
-            log.info(f"  ✓ Ордер принят [{outcome}]: {order_id}")
+            log.info(f"  ✓ Ордер принят: {order_id}")
             return order_id
         except Exception as e:
-            log.error(f"  ✗ Ошибка [{outcome}]: {e}")
+            log.error(f"  ✗ Ошибка: {e}")
             return None
 
-    def has_market_position(self, market_key: str) -> bool:
-        for _, pos in self.positions.items():
-            if isinstance(pos, dict) and pos.get("market_key") == market_key:
-                return True
-        return False
+    def place_sell_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        tick_size: str,
+        question: str,
+    ) -> Optional[str]:
+        """
+        Создать и отправить лимитный ордер на продажу по указанной цене.
+
+        :param token_id: ID токена outcome, который продаём
+        :param price: желаемая цена продажи (будет округлена по тик-сайзу)
+        :param size: количество контрактов, которое нужно продать
+        :param tick_size: минимальный шаг цены для этого токена
+        :param question: текст вопроса рынка — используется только для логов
+        :return: order_id при успешной отправке, иначе None
+        """
+        tick = float(tick_size)
+
+        # Округляем цену по тик-сайзу. Для продажи ставим немного ниже лучшего бида
+        order_price = price
+        order_price = round(round(order_price / tick) * tick, 6)
+
+        revenue = round(order_price * size, 4)
+        log.info(
+            f"  → LIMIT SELL | {question[:50]}"
+            f" | price={order_price:.4f} | size={size} | revenue=${revenue}"
+        )
+
+        try:
+            signed = self.client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=order_price,
+                    size=size,
+                    side=SELL,
+                )
+            )
+            resp     = self.client.post_order(signed, OrderType.GTC)
+            order_id = resp.get("orderID") or resp.get("order_id", "unknown")
+            log.info(f"  ✓ SELL ордер принят: {order_id}")
+            return order_id
+        except Exception as e:
+            log.error(f"  ✗ Ошибка при продаже: {e}")
+            return None
+
+    def run_close(self) -> None:
+        """
+        Режим закрытия позиций. Проходит по сохранённым позициям и закрывает
+        те, которые достигли порога прибыли CLOSE_PROFIT_PCT. Закрытие
+        осуществляется лимитным ордером по цене, близкой к лучшему бид-курсу.
+        После успешной продажи позиция удаляется из списка и файл обновляется.
+        """
+        log.info("=" * 60)
+        log.info(f"Запуск режима закрытия: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Убедимся, что позиции загружены
+        if not self.positions:
+            self.load_positions()
+
+        closed = 0
+
+        for token_id, info in list(self.positions.items()):
+            entry_price = float(info.get("price", 0))
+            size        = float(info.get("size", 0))
+            question    = info.get("question", "")
+
+            if entry_price <= 0 or size <= 0:
+                continue
+
+            # Текущая лучшая бид цена
+            best_bid = get_best_bid(self.client, token_id)
+            if best_bid is None:
+                continue
+
+            # Рассчитываем прирост: (текущая цена - вход) / вход
+            profit_ratio = (best_bid - entry_price) / entry_price
+            if profit_ratio * 100 < CLOSE_PROFIT_PCT:
+                # Недостаточная прибыль — пропускаем
+                continue
+
+            tick_size = get_tick_size(self.client, token_id)
+            # Ставим цену чуть ниже лучшего бида для быстрой продажи
+            sell_price = best_bid - PRICE_OFFSET
+            if sell_price < MIN_PRICE:
+                sell_price = MIN_PRICE
+
+            log.info(
+                f"✔ Закрываем позицию | {question[:60]}"
+                f" | entry={entry_price:.4f} | bid={best_bid:.4f} | gain={profit_ratio*100:.1f}%"
+            )
+
+            order_id = self.place_sell_order(
+                token_id=token_id,
+                price=sell_price,
+                size=size,
+                tick_size=tick_size,
+                question=question,
+            )
+            if order_id:
+                closed += 1
+                # Удаляем закрытую позицию
+                self.positions.pop(token_id, None)
+
+            # Делаем паузу, чтобы не отправлять слишком много ордеров
+            time.sleep(0.3)
+
+        # Сохраняем обновлённый список позиций
+        self.save_positions()
+        log.info("=" * 60)
+        log.info(f"Режим закрытия завершён. Закрыто позиций: {closed}")
 
     def run_once(self):
         log.info("=" * 60)
@@ -325,98 +431,92 @@ class PolymarketBot:
             if not token_ids:
                 continue
 
+            token_id = token_ids[0]
+            if token_id in self.positions:
+                continue
+
             question = m.get("question") or m.get("_event_title", "")
-            market_key = m.get("questionID") or question
+            best_ask = get_best_ask(self.client, token_id)
+            if best_ask is None:
+                continue
+            if not (MIN_PRICE <= best_ask <= MAX_PRICE):
+                continue
 
             days = days_until(m.get("_end_date"))
             if days is None or days < MIN_DAYS or days > MAX_DAYS:
                 continue
 
+            if is_election(m):
+                continue
 
             cat = (m.get("_event_tags") or ["other"])[0].lower()
             if seen_cats.get(cat, 0) >= MAX_PER_CAT:
                 continue
 
-
-            outcomes = build_outcomes(token_ids)
-            if not outcomes:
-                continue
+            size      = calc_size(portfolio, best_ask)
+            tick_size = get_tick_size(self.client, token_id)
 
             log.info(
-                f"MARKET outcomes | {question[:60]} | token_ids={token_ids} | outcomes={outcomes}"
+                f"✔ [{cat.upper()}] {question[:60]}"
+                f" | ask={best_ask:.4f} | days={days:.0f} | size={size}"
             )
 
+            order_id = self.place_order(
+                token_id=token_id,
+                price=best_ask,
+                size=size,
+                tick_size=tick_size,
+                question=question,
+            )
 
-            for outcome, token_id in outcomes:
-                position_key = f"{token_id}:{outcome}"
-                if position_key in self.positions:
-                    continue
+            if order_id:
+                self.positions[token_id] = {
+                    "order_id":  order_id,
+                    "question":  question,
+                    "category":  cat,
+                    "price":     best_ask,
+                    "size":      size,
+                    "placed_at": datetime.utcnow().isoformat(),
+                }
+                seen_cats[cat] = seen_cats.get(cat, 0) + 1
+                placed += 1
 
-
-                best_ask = get_best_ask(self.client, token_id)
-                if best_ask is None:
-                    continue
-                if not (MIN_PRICE <= best_ask <= MAX_PRICE):
-                    continue
-
-                best_bid = get_best_bid(self.client, token_id)
-                tick_size = get_tick_size(self.client, token_id)
-                resting_price = calc_resting_buy_price(best_bid, best_ask, tick_size)
-                if resting_price is None:
-                    continue
-
-                size = calc_size(portfolio, resting_price)
-
-                log.info(
-                    f"✔ [{cat.upper()}] [{outcome}] {question[:60]}"
-                    f" | bid={(best_bid or 0):.4f} | ask={best_ask:.4f}"
-                    f" | resting={resting_price:.4f} | days={days:.0f} | size={size}"
-                )
-
-                order_id = self.place_order(
-                    token_id=token_id,
-                    outcome=outcome,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    size=size,
-                    tick_size=tick_size,
-                    question=question,
-                )
-
-                if order_id:
-                    self.positions[position_key] = {
-                        "order_id": order_id,
-                        "market_key": market_key,
-                        "outcome": outcome,
-                        "token_id": token_id,
-                        "question": question,
-                        "category": cat,
-                        "price": resting_price,
-                        "size": size,
-                        "placed_at": datetime.utcnow().isoformat(),
-                    }
-                    seen_cats[cat] = seen_cats.get(cat, 0) + 1
-                    placed += 1
-
-                time.sleep(0.3)
+            time.sleep(0.3)
 
         log.info("=" * 60)
         log.info(f"Готово! Ордеров размещено: {placed}")
 
-        with open("positions.json", "w", encoding="utf-8") as f:
-            json.dump(self.positions, f, indent=2, ensure_ascii=False)
+        # Сохраняем позиции в файл после выполнения открытого режима
+        self.save_positions()
         log.info("Позиции сохранены в positions.json")
 
 
+# ════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if not PRIVATE_KEY:
         log.error("PRIVATE_KEY не задан в .env!")
-        raise SystemExit(1)
-
+        exit(1)
     if not FUNDER_ADDRESS:
         log.warning(
             "FUNDER_ADDRESS не задан! Если деньги на proxy-кошельке "
             "Polymarket — добавь FUNDER_ADDRESS=0x... в .env"
         )
 
-    PolymarketBot().run_once()
+    # Спрашиваем у пользователя, в каком режиме запускать бота: открытие (open) или закрытие (close)
+    try:
+        user_input = input(
+            "Выберите режим работы:\n"
+            "  open  – открывать новые позиции по стратегии\n"
+            "  close – закрывать существующие позиции при достижении прибыли\n"
+            "Введите режим (open/close) и нажмите Enter [open]: "
+        ).strip().lower()
+    except Exception:
+        # Если по какой-то причине input не работает (например, нет stdin), берём режим по умолчанию
+        user_input = "open"
+
+    mode = user_input or "open"
+    bot = PolymarketBot()
+    if mode.startswith("c"):
+        bot.run_close()
+    else:
+        bot.run_once()
